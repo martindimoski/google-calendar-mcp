@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
 import { google, type calendar_v3 } from 'googleapis';
 import { CalendarApiError } from '../errors/CalendarApiError.js';
+import { logApiError, logApiRequest, logApiResponse } from '../utils/apiLogger.js';
 
 /**
  * Subset of Google Calendar v3 access role values, narrowed to the ones
@@ -141,6 +142,7 @@ export class GoogleCalendarService {
 
         const summaries: CalendarSummary[] = [];
         let pageToken: string | undefined;
+        let pageCount = 0;
 
         try {
             do {
@@ -148,17 +150,63 @@ export class GoogleCalendarService {
                     ...baseParams,
                     ...(pageToken !== undefined ? { pageToken } : {}),
                 };
+                pageCount += 1;
+                logApiRequest('calendarList.list', params);
                 const response = await this.calendar.calendarList.list(params);
-                for (const entry of response.data.items ?? []) {
+                const items = response.data.items ?? [];
+                logApiResponse(
+                    'calendarList.list',
+                    `page=${pageCount} items=${items.length} hasNextPage=${response.data.nextPageToken ? 'yes' : 'no'}`,
+                    response.data,
+                );
+                for (const entry of items) {
                     summaries.push(toSummary(entry));
                 }
                 pageToken = response.data.nextPageToken ?? undefined;
             } while (pageToken !== undefined);
         } catch (error) {
+            logApiError('calendarList.list', error);
             throw new CalendarApiError('calendarList.list', error);
         }
 
+        console.log(
+            `[GCal] RESPONSE calendarList.list complete: ${summaries.length} calendar(s) across ${pageCount} page(s)`,
+        );
         return summaries;
+    }
+
+    /**
+     * Subscribes the service account to a calendar that has already been
+     * shared with its email. This is the bridge between "the calendar
+     * was shared with me" (an ACL on the calendar) and "the calendar
+     * appears in my own calendar list" (`calendarList.list`).
+     *
+     * The call is naturally idempotent — Google returns the existing
+     * entry if the service account is already subscribed.
+     *
+     * @throws {@link CalendarApiError} when the calendar id is unknown
+     *   or the service account lacks at least free/busy access to it.
+     */
+    public async subscribeCalendar(calendarId: string): Promise<CalendarSummary> {
+        if (!calendarId || calendarId.trim() === '') {
+            throw new Error('subscribeCalendar: calendarId is required.');
+        }
+
+        const requestBody: calendar_v3.Schema$CalendarListEntry = { id: calendarId };
+
+        try {
+            logApiRequest('calendarList.insert', { id: calendarId });
+            const response = await this.calendar.calendarList.insert({ requestBody });
+            logApiResponse(
+                'calendarList.insert',
+                `subscribed id=${response.data.id ?? '<unknown>'}`,
+                response.data,
+            );
+            return toSummary(response.data);
+        } catch (error) {
+            logApiError('calendarList.insert', error);
+            throw new CalendarApiError('calendarList.insert', error);
+        }
     }
 
     /**
@@ -195,18 +243,32 @@ export class GoogleCalendarService {
             throw new Error('findAvailableSlots: slotDurationMinutes must be a positive integer.');
         }
 
+        const requestBody: calendar_v3.Schema$FreeBusyRequest = {
+            timeMin: timeMin.toISOString(),
+            timeMax: timeMax.toISOString(),
+            items: calendarIds.map((id) => ({ id })),
+            ...(timeZone !== undefined ? { timeZone } : {}),
+        };
+
         let payload: calendar_v3.Schema$FreeBusyResponse;
         try {
-            const response = await this.calendar.freebusy.query({
-                requestBody: {
-                    timeMin: timeMin.toISOString(),
-                    timeMax: timeMax.toISOString(),
-                    items: calendarIds.map((id) => ({ id })),
-                    ...(timeZone !== undefined ? { timeZone } : {}),
-                },
-            });
+            logApiRequest('freebusy.query', requestBody);
+            const response = await this.calendar.freebusy.query({ requestBody });
             payload = response.data;
+
+            const calendarsField = payload.calendars ?? {};
+            const summaryParts = Object.entries(calendarsField).map(([id, cal]) => {
+                const busyCount = cal.busy?.length ?? 0;
+                const errCount = cal.errors?.length ?? 0;
+                return `${id}=busy:${busyCount}${errCount > 0 ? ` errors:${errCount}` : ''}`;
+            });
+            logApiResponse(
+                'freebusy.query',
+                `calendars={ ${summaryParts.join(', ')} }`,
+                payload,
+            );
         } catch (error) {
+            logApiError('freebusy.query', error);
             throw new CalendarApiError('freebusy.query', error);
         }
 

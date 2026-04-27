@@ -9,6 +9,7 @@ import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { GoogleCalendarService } from './services/GoogleCalendarService.js';
 import { registerListCalendarsTool } from './tools/listCalendars.js';
 import { registerFindAvailableSlotsTool } from './tools/findAvailableSlots.js';
+import { registerSubscribeCalendarTool } from './tools/subscribeCalendar.js';
 
 const PORT = Number.parseInt(process.env['PORT'] ?? '3000', 10);
 const SERVICE_ACCOUNT_KEY_FILE = process.env['GOOGLE_SERVICE_ACCOUNT_KEY_FILE'];
@@ -21,23 +22,36 @@ if (!SERVICE_ACCOUNT_KEY_FILE) {
 }
 
 // Eagerly construct the calendar service so that credential/config issues
-// surface at startup rather than on the first tool invocation.
+// surface at startup rather than on the first tool invocation. The service
+// itself is stateless and safe to share across sessions.
 const calendarService = new GoogleCalendarService(SERVICE_ACCOUNT_KEY_FILE);
 
-const mcpServer = new McpServer(
-    {
-        name: 'calendar-mcp',
-        version: '1.0.0',
-    },
-    {
-        capabilities: {
-            tools: {},
+/**
+ * Builds a fresh `McpServer` with all tools registered. Streamable HTTP
+ * sessions are 1:1 with transports, and the SDK enforces that one server
+ * connects to exactly one transport — so each new session gets its own
+ * server instance. Tool registration is cheap; the heavyweight Google
+ * client lives on `calendarService` and is shared.
+ */
+function createMcpServer(): McpServer {
+    const server = new McpServer(
+        {
+            name: 'calendar-mcp',
+            version: '1.0.0',
         },
-    },
-);
+        {
+            capabilities: {
+                tools: {},
+            },
+        },
+    );
 
-registerListCalendarsTool(mcpServer, calendarService);
-registerFindAvailableSlotsTool(mcpServer, calendarService);
+    registerListCalendarsTool(server, calendarService);
+    registerFindAvailableSlotsTool(server, calendarService);
+    registerSubscribeCalendarTool(server, calendarService);
+
+    return server;
+}
 
 const app = express();
 app.use(cors());
@@ -70,6 +84,8 @@ const handleMcpRequest = async (req: Request, res: Response): Promise<void> => {
             return;
         }
 
+        const sessionServer = createMcpServer();
+
         transport = new StreamableHTTPServerTransport({
             sessionIdGenerator: () => randomUUID(),
             onsessioninitialized: (sid) => {
@@ -81,6 +97,12 @@ const handleMcpRequest = async (req: Request, res: Response): Promise<void> => {
             if (transport?.sessionId) {
                 transports.delete(transport.sessionId);
             }
+            // Tear down the per-session server so its handlers and any
+            // pending state are released. Best-effort: errors here are
+            // logged but not propagated to the client.
+            void sessionServer.close().catch((err: unknown) => {
+                console.error('[MCP] Error closing session server', err);
+            });
         };
 
         try {
@@ -88,9 +110,12 @@ const handleMcpRequest = async (req: Request, res: Response): Promise<void> => {
             // while the `Transport` interface declares it as optional (without
             // `| undefined`). Semantically identical, but `exactOptionalPropertyTypes`
             // treats them as distinct.
-            await mcpServer.connect(transport as Transport);
+            await sessionServer.connect(transport as Transport);
         } catch (error) {
             console.error('[MCP] Failed to establish session', error);
+            void sessionServer.close().catch(() => {
+                /* swallow: we're already in an error path */
+            });
             if (!res.headersSent) {
                 res.status(500).end('Failed to establish MCP session');
             }
