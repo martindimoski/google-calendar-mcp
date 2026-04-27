@@ -1,0 +1,17 @@
+# Project Context
+We are building a remote Model Context Protocol (MCP) server using Node.js, Express.js, and TypeScript. 
+The server will integrate with the Google Calendar API to list calendars, find time slots, and create events.
+
+# Architecture & Style Guidelines
+- Use TypeScript with strict mode enabled.
+- Mimic a Spring Boot-style architecture: separate Routes (Controllers), Services (Business Logic), and Config.
+- Use async/await. Avoid raw Promises or callbacks.
+- Use the official `@modelcontextprotocol/sdk` utilizing the `StreamableHTTPServerTransport` for remote communication (SSE transport is deprecated).
+- Use the official `googleapis` npm package.
+
+# Error Handling
+- Fail fast and throw descriptive custom errors.
+- Ensure all Google API errors are caught and transformed into readable MCP tool error responses.
+
+# Dependencies
+- express, @modelcontextprotocol/sdk, googleapis, dotenv, cors

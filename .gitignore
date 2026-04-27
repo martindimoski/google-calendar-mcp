@@ -1,0 +1,32 @@
+# --- Node / TypeScript ---
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+.npm
+.eslintcache
+
+# --- Logs ---
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+logs/
+*.log
+
+# --- Environment & secrets ---
+.env
+.env.*
+!.env.example
+service-account.json
+*-service-account.json
+*.pem
+*.key
+
+# --- OS / Editor ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
