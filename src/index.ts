@@ -10,6 +10,7 @@ import { GoogleCalendarService } from './services/GoogleCalendarService.js';
 import { registerListCalendarsTool } from './tools/listCalendars.js';
 import { registerFindAvailableSlotsTool } from './tools/findAvailableSlots.js';
 import { registerSubscribeCalendarTool } from './tools/subscribeCalendar.js';
+import { registerCreateEventTool } from './tools/createEvent.js';
 
 const PORT = Number.parseInt(process.env['PORT'] ?? '3000', 10);
 const SERVICE_ACCOUNT_KEY_FILE = process.env['GOOGLE_SERVICE_ACCOUNT_KEY_FILE'];
@@ -49,6 +50,7 @@ function createMcpServer(): McpServer {
     registerListCalendarsTool(server, calendarService);
     registerFindAvailableSlotsTool(server, calendarService);
     registerSubscribeCalendarTool(server, calendarService);
+    registerCreateEventTool(server, calendarService);
 
     return server;
 }

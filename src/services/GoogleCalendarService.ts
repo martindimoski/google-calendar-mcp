@@ -1,6 +1,8 @@
 import { existsSync } from 'node:fs';
 import { google, type calendar_v3 } from 'googleapis';
 import { CalendarApiError } from '../errors/CalendarApiError.js';
+import { CalendarNotSubscribedError } from '../errors/CalendarNotSubscribedError.js';
+import { TimeSlotConflictError } from '../errors/TimeSlotConflictError.js';
 import { logApiError, logApiRequest, logApiResponse } from '../utils/apiLogger.js';
 
 /**
@@ -62,6 +64,41 @@ export interface FindAvailableSlotsResult {
      * caller decides whether the partial result is usable.
      */
     calendarErrors: Record<string, string[]>;
+}
+
+export type SendUpdatesPolicy = 'all' | 'externalOnly' | 'none';
+
+export interface CreateEventInput {
+    /** Calendar to create the event on. Must be subscribed by this server. */
+    calendarId: string;
+    /** Email of the user requesting the booking; added as an attendee. */
+    userEmail: string;
+    /** Inclusive start of the event. */
+    start: Date;
+    /** Exclusive end of the event. */
+    end: Date;
+    /** Event title. Defaults to "New event" when omitted. */
+    summary?: string;
+    /** Optional long-form description / notes. */
+    description?: string;
+    /** IANA timezone for `start` / `end`. Defaults to UTC. */
+    timeZone?: string;
+    /** Whether Google should email attendees. Defaults to "all". */
+    sendUpdates?: SendUpdatesPolicy;
+}
+
+export interface CreatedEvent {
+    id: string;
+    summary: string;
+    start: string;
+    end: string;
+    htmlLink?: string | undefined;
+    organizerEmail?: string | undefined;
+    attendees: string[];
+    /** Email passed in as the booker; recorded in the event description. */
+    bookerEmail?: string | undefined;
+    /** True when no invite email was sent (always true under Option 1). */
+    inviteSent: boolean;
 }
 
 /**
@@ -210,6 +247,193 @@ export class GoogleCalendarService {
     }
 
     /**
+     * Creates an event on a subscribed calendar after running three
+     * pre-flight checks, in order:
+     *
+     *   1. The calendar must be subscribed by this server (i.e. it
+     *      appears in `calendarList`). Otherwise we throw
+     *      {@link CalendarNotSubscribedError} pointing at
+     *      `subscribe_calendar`.
+     *   2. The requested `[start, end)` interval must not overlap any
+     *      busy block on that calendar. Otherwise we throw
+     *      {@link TimeSlotConflictError} with the conflicting periods.
+     *   3. Only after both pass do we call `events.insert`.
+     *
+     * The user's email is added as an attendee. Email format is
+     * validated at the tool layer (Zod) and re-validated here so the
+     * service is safe to call from anywhere.
+     *
+     * @throws {@link CalendarNotSubscribedError} when step 1 fails.
+     * @throws {@link TimeSlotConflictError} when step 2 fails.
+     * @throws {@link CalendarApiError} for any underlying Google failure.
+     */
+    public async createEvent(input: CreateEventInput): Promise<CreatedEvent> {
+        const { calendarId, userEmail, start, end } = input;
+        const summary = input.summary ?? 'New event';
+        const sendUpdates: SendUpdatesPolicy = input.sendUpdates ?? 'all';
+
+        if (!calendarId || calendarId.trim() === '') {
+            throw new Error('createEvent: calendarId is required.');
+        }
+        if (!isValidEmail(userEmail)) {
+            throw new Error(`createEvent: "${userEmail}" is not a valid email address.`);
+        }
+        if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+            throw new Error('createEvent: start and end must be valid dates.');
+        }
+        if (end.getTime() <= start.getTime()) {
+            throw new Error('createEvent: end must be strictly after start.');
+        }
+
+        // --- Step 1: calendar must be in our subscribed list -------------
+        await this.assertCalendarSubscribed(calendarId);
+
+        // --- Step 2: time slot must be free -----------------------------
+        const conflicts = await this.findConflicts(calendarId, start, end);
+        if (conflicts.length > 0) {
+            throw new TimeSlotConflictError(
+                calendarId,
+                { start: start.toISOString(), end: end.toISOString() },
+                conflicts.map((c) => ({
+                    start: new Date(c.start).toISOString(),
+                    end: new Date(c.end).toISOString(),
+                })),
+            );
+        }
+
+        // --- Step 3: insert the event -----------------------------------
+        // We deliberately do NOT pass `attendees`. A bare service account
+        // (no Domain-Wide Delegation) is forbidden by Google from inviting
+        // attendees — the API rejects the entire insert with
+        // "Service accounts cannot invite attendees without Domain-Wide
+        // Delegation of Authority." Instead, we record the booker's email
+        // inside the event description so the information is preserved
+        // and visible on the event itself.
+        const description = composeDescription(input.description, userEmail);
+
+        const requestBody: calendar_v3.Schema$Event = {
+            summary,
+            description,
+            start: {
+                dateTime: start.toISOString(),
+                ...(input.timeZone !== undefined ? { timeZone: input.timeZone } : {}),
+            },
+            end: {
+                dateTime: end.toISOString(),
+                ...(input.timeZone !== undefined ? { timeZone: input.timeZone } : {}),
+            },
+        };
+
+        try {
+            // `sendUpdates` is intentionally omitted: with no attendees,
+            // there is nobody to notify and Google would ignore it anyway.
+            // It remains in `CreateEventInput` for forward-compat with a
+            // future DWD-enabled path.
+            void sendUpdates;
+            logApiRequest('events.insert', { calendarId, requestBody });
+            const response = await this.calendar.events.insert({
+                calendarId,
+                requestBody,
+            });
+            logApiResponse(
+                'events.insert',
+                `created id=${response.data.id ?? '<unknown>'} on calendarId=${calendarId}`,
+                response.data,
+            );
+            const created = toCreatedEvent(response.data);
+            return { ...created, bookerEmail: userEmail, inviteSent: false };
+        } catch (error) {
+            logApiError('events.insert', error);
+            throw new CalendarApiError('events.insert', error);
+        }
+    }
+
+    /**
+     * Throws {@link CalendarNotSubscribedError} if the given calendar id
+     * is not in this service account's `calendarList`. Implemented via
+     * `calendarList.get` so we don't have to fetch the full list.
+     */
+    private async assertCalendarSubscribed(calendarId: string): Promise<void> {
+        try {
+            logApiRequest('calendarList.get', { calendarId });
+            const response = await this.calendar.calendarList.get({ calendarId });
+            logApiResponse(
+                'calendarList.get',
+                `subscribed id=${response.data.id ?? '<unknown>'}`,
+                response.data,
+            );
+        } catch (error) {
+            const status = extractStatusCode(error);
+            if (status === 404) {
+                logApiError('calendarList.get', error);
+                throw new CalendarNotSubscribedError(calendarId);
+            }
+            logApiError('calendarList.get', error);
+            throw new CalendarApiError('calendarList.get', error);
+        }
+    }
+
+    /**
+     * Returns busy intervals on `calendarId` that overlap with the
+     * `[start, end)` window. Used by `createEvent` for the conflict
+     * check; broken out so it's easy to test and reuse.
+     */
+    private async findConflicts(
+        calendarId: string,
+        start: Date,
+        end: Date,
+    ): Promise<Array<{ start: number; end: number }>> {
+        const requestBody: calendar_v3.Schema$FreeBusyRequest = {
+            timeMin: start.toISOString(),
+            timeMax: end.toISOString(),
+            items: [{ id: calendarId }],
+        };
+
+        let payload: calendar_v3.Schema$FreeBusyResponse;
+        try {
+            logApiRequest('freebusy.query (conflict-check)', requestBody);
+            const response = await this.calendar.freebusy.query({ requestBody });
+            payload = response.data;
+            logApiResponse(
+                'freebusy.query (conflict-check)',
+                `busy=${payload.calendars?.[calendarId]?.busy?.length ?? 0}`,
+                payload,
+            );
+        } catch (error) {
+            logApiError('freebusy.query (conflict-check)', error);
+            throw new CalendarApiError('freebusy.query', error);
+        }
+
+        const cal = payload.calendars?.[calendarId];
+        if (cal?.errors && cal.errors.length > 0) {
+            // freeBusy reports per-calendar errors *inside* a 200 response.
+            // Surface them as a top-level failure instead of silently treating
+            // the calendar as fully free.
+            throw new CalendarApiError(
+                'freebusy.query',
+                new Error(
+                    `Calendar "${calendarId}" returned errors during conflict check: ` +
+                        cal.errors.map((e) => e.reason ?? 'unknown').join(', '),
+                ),
+            );
+        }
+
+        const overlaps: Array<{ start: number; end: number }> = [];
+        const reqStart = start.getTime();
+        const reqEnd = end.getTime();
+        for (const period of cal?.busy ?? []) {
+            if (!period.start || !period.end) continue;
+            const bStart = Date.parse(period.start);
+            const bEnd = Date.parse(period.end);
+            if (Number.isNaN(bStart) || Number.isNaN(bEnd)) continue;
+            if (bStart < reqEnd && bEnd > reqStart) {
+                overlaps.push({ start: bStart, end: bEnd });
+            }
+        }
+        return overlaps;
+    }
+
+    /**
      * Finds bookable slots within `[timeMin, timeMax)` by querying the
      * Google Calendar freeBusy API for the supplied calendars, merging
      * their busy intervals, and emitting consecutive non-overlapping
@@ -354,6 +578,62 @@ function toSummary(entry: calendar_v3.Schema$CalendarListEntry): CalendarSummary
         ...(typeof entry.selected === 'boolean' ? { selected: entry.selected } : {}),
         ...(typeof entry.hidden === 'boolean' ? { hidden: entry.hidden } : {}),
     };
+}
+
+/** RFC 5322-lite check; we deliberately keep it permissive. */
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function isValidEmail(value: string): boolean {
+    return typeof value === 'string' && EMAIL_REGEX.test(value);
+}
+
+function extractStatusCode(error: unknown): number | undefined {
+    if (typeof error === 'object' && error !== null) {
+        const e = error as { code?: unknown; status?: unknown; response?: { status?: unknown } };
+        if (typeof e.code === 'number') return e.code;
+        if (typeof e.status === 'number') return e.status;
+        if (typeof e.response?.status === 'number') return e.response.status;
+    }
+    return undefined;
+}
+
+function toCreatedEvent(event: calendar_v3.Schema$Event): CreatedEvent {
+    if (!event.id) {
+        throw new CalendarApiError(
+            'events.insert',
+            new Error('Google did not return an event id for the created event.'),
+        );
+    }
+    const startISO = event.start?.dateTime ?? event.start?.date ?? '';
+    const endISO = event.end?.dateTime ?? event.end?.date ?? '';
+    const attendees = (event.attendees ?? [])
+        .map((a) => a.email)
+        .filter((email): email is string => typeof email === 'string' && email.length > 0);
+
+    return {
+        id: event.id,
+        summary: event.summary ?? 'New event',
+        start: startISO,
+        end: endISO,
+        attendees,
+        inviteSent: false,
+        ...(event.htmlLink ? { htmlLink: event.htmlLink } : {}),
+        ...(event.organizer?.email ? { organizerEmail: event.organizer.email } : {}),
+    };
+}
+
+/**
+ * Builds the event description, preserving any caller-supplied text and
+ * appending a single tagged line that records the booker's email. The
+ * tag is greppable and stable so we (or a future tool) can later parse
+ * it back out of an existing event.
+ */
+function composeDescription(userDescription: string | undefined, bookerEmail: string): string {
+    const bookerLine = `Booked via MCP for: ${bookerEmail}`;
+    if (userDescription === undefined || userDescription.trim() === '') {
+        return bookerLine;
+    }
+    return `${userDescription}\n\n${bookerLine}`;
 }
 
 /**
